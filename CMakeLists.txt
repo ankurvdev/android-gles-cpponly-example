@@ -1,0 +1,1 @@
+add_library(example main.cpp SimpleRenderer.cpp)

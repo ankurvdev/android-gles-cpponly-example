@@ -53,7 +53,7 @@ android {
         targetSdkVersion 28
         externalNativeBuild {
             cmake {
-                arguments '-DANDROID_STL=c++_static' 
+                arguments '-DANDROID_STL=c++_static'
             }
         }
     }
@@ -66,7 +66,6 @@ android {
     }
     externalNativeBuild {
         cmake {
-            version '3.17.0'
             path 'src/main/cpp/CMakeLists.txt'
         }
     }
@@ -117,7 +116,7 @@ TEMPLATES["app/src/main/AndroidManifest.xml"] = """
 TEMPLATES["app/src/main/cpp/CMakeLists.txt"] = """
 cmake_minimum_required(VERSION 3.4.1)
 project($$$Application.BinaryName$$$)
-add_subdirectory(/home/ankurv/avid/cmake avid)
+add_subdirectory("$$$SrcDir$$$" $$$Application.BinaryName$$$)
 
 # build native_app_glue as a static lib
 set(${CMAKE_C_FLAGS}, "${CMAKE_C_FLAGS}")
@@ -138,8 +137,9 @@ set(applib $$$Application.BinaryName$$$)
 if (NOT TARGET ${applib})
     message(FATAL_ERROR "Cannot find Target ${applib}"e)
 endif()
-target_link_libraries(native_$$$Application.BinaryName$$$ ${applib} android EGL GLESv2 GLESv1_CM log)
 
+target_include_directories(${applib} PRIVATE ${ANDROID_NDK}/sources/android/native_app_glue)
+target_link_libraries(native_$$$Application.BinaryName$$$ ${applib} android EGL GLESv2 GLESv1_CM log)
 """
 
 TEMPLATES["app/src/main/res/values/strings.xml"] = """<?xml version="1.0" encoding="utf-8"?>
@@ -213,10 +213,10 @@ class BuildEnv:
         return self._WriteValue(name, input("Cannot Detect Path for : " + name + " :: "))
 
     def _SearchExeInPath(self, bindir, name):
-        path = next(pathlib.Path(bindir).rglob(name), None)
-        print(bindir, path, name)
+        path = None
         if sys.platform == "win32" or sys.platform == "Windows":
             path = path or next(pathlib.Path(bindir).rglob(name + ".exe"), None) or next(pathlib.Path(bindir).rglob(name + ".bat"), None)
+        path = path or next(pathlib.Path(bindir).rglob(name), None)
         if path: os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
         return str(path) if path else None
 
@@ -224,10 +224,10 @@ class BuildEnv:
         if pattern != None:
             url = [u for u in HTMLUrlExtractor(url).urls if re.search(pattern, u)][0]
         downloadtofile = os.path.join(downloadpath,"tmp", name + ".zip")
-        print("Downloading {} at {} ::  Url = {}".format(name, downloadpath, url))
         os.makedirs(os.path.dirname(downloadtofile), exist_ok=True)
         bindir = os.path.join(downloadpath, name)
         if not os.path.exists(bindir):
+            print("Downloading {} at {} ::  Url = {}".format(name, downloadpath, url))
             if not os.path.exists(downloadtofile):
                 urllib.request.urlretrieve(url, downloadtofile)
             zip_ref = zipfile.ZipFile(downloadtofile, 'r')
@@ -249,9 +249,10 @@ class BuildEnv:
         path = self._FindOrGetConfig("BuildEnv.BinDownloadPath", ["BUILD_TOOLS_DOWNLOAD_PATH"])
         return self._WriteValue(config, self._Download(path, name, url, pattern))
 
-    def GetJava(self):
-        LinkDir = 'http://jdk.java.net/14/'
-        Pattern = 'openjdk-14_windows-x64_bin.zip'
+    def GetJava8(self):
+        return self._SearchExeInPath(os.path.dirname(os.path.dirname(self.GetAndroidStudioPath())), 'java')
+        LinkDir = 'https://jdk.java.net/java-se-ri/8-MR3'
+        Pattern = 'openjdk-8u41-b04-windows-i586-14_jan_2020.zip'
         return self._FindOrDownload('java', config = "Android.JavaPath", envvars = ['${JAVA_HOME}/bin'], url = LinkDir, pattern = Pattern)
 
     def GetAndroidSdkRoot(self):
@@ -261,6 +262,9 @@ class BuildEnv:
         #return self._FindOrGetConfig("Android.SdkRoot", ['${ANDROID_SDK_ROOT}', '${ANDROID_HOME}'])
     
     def GetAndroidStudioPath(self):
+        LinkDir = 'https://developer.android.com/studio'
+        Pattern = 'android-studio-ide-192.6308749-windows.zip'
+        return self._FindOrDownload('studio', config = "Android.StudioPath", envvars = ['${ANDROID_STUDIO_PATH}/bin'], url = LinkDir, pattern = Pattern)
         return self._FindOrGetConfig("Android.StudioPath", ['${ANDROID_HOME}'])
 
     def GetImageMagick(self):
@@ -289,12 +293,20 @@ class AndroidApk:
         self.buildenv = BuildEnv()
         self.config = configparser.ConfigParser()
         self.config.read(str(config))
+        self.configfile = config
         self.gradle = self.buildenv.GetGradlePath()
         self.imagemagick_convert = os.path.join(self.buildenv.GetImageMagick(), 'convert')
-        self.builddir = self.buildenv.GetBuildPath()
-        self.sdkroot = self.buildenv.GetAndroidSdkRoot()
-        self.java = self.buildenv.GetJava()
+        self.builddir = os.path.join(self.buildenv.GetBuildPath(), self._ConfigValue("Android.AppPackageName"))
+        self.sdkroot = os.path.dirname(os.path.dirname(os.path.dirname(self.buildenv.GetAndroidSdkRoot())))
+        self.javahome = os.path.dirname(os.path.dirname(self.buildenv.GetJava8()))
         self.cmake = self.buildenv.GetCMakePath()
+        self.sdkmanager = self.buildenv.GetAndroidSdkRoot()
+        self.env = {
+                "ANDROID_HOME" : self.sdkroot,
+                "ANDROID_SDK_ROOT" : self.sdkroot,
+                "JAVA_HOME" :  self.javahome
+        }
+        os.makedirs(self.builddir, exist_ok=True)
 #        self.studiopath = self.buildenv.GetAndroidStudioPath()
 
     def Generate(self):
@@ -303,24 +315,30 @@ class AndroidApk:
             self._GenerateFileWithContents(k, self._ExpandTemplate(v))
         for k, v in IMAGES.items():
             self._GenerateImage(k, v)
+        self._Run([self.sdkmanager, "--sdk_root=" + self.sdkroot, "--licenses"]) 
 
-    def _Run(self, cmd, env = None):
-        my_env = os.environ
-        if env != None:
-            for k, v in env.items():
-                my_env[k] = v
-        rslt = subprocess.run(cmd, cwd=self.builddir, capture_output=True, env = my_env)
+    def AcceptLicenses(self):
+        p = subprocess.Popen([self.sdkmanager, "--sdk_root=" + self.sdkroot, "--licenses"], stdout=subprocess.PIPE,stdin=subprocess.PIPE)
+        p.communicate()[0]
+        p.stdin.close()
+
+    def _Run(self, cmd, extraenv = None):
+        my_env = os.environ   
+        for k, v in self.env.items():
+            my_env[k] = v
+        r, w = os.pipe() 
+        os.write(w, b'y\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\n\ny\ny\ny\ny\ny\ny\ny\ny\ny\n') #expects a bytes type object
+        os.close(w)
+        rslt = subprocess.run(cmd, cwd=self.builddir, stdin=r, capture_output=True, env = my_env, shell=True)
         if rslt.returncode != 0:
+            print(" ".join(cmd))
+            print(self.env)
+            print(self.builddir)
             raise Exception("Error Building : Command = " + " ".join(cmd) + "\n\n STDOUT = " + rslt.stdout.decode() + "\n\nSTDERR = " + rslt.stderr.decode())
+        return rslt.stdout.decode()
 
     def Build(self):
-        self._Run(
-            ["./gradlew", "build"], 
-            {
-                "ANDROID_HOME" : self.sdkroot,
-                "ANDROID_SDK_ROOT" : self.sdkroot,
-                "JAVA_HOME" :  os.path.join(self.studiopath, "jre")
-            })       
+        self._Run(["gradlew", "build"])
 
     def _GenerateFileWithContents(self, path, newcontents):
         fname =  os.path.join(self.builddir, path)
@@ -352,6 +370,7 @@ class AndroidApk:
         ])
 
     def _ConfigValue(self, name):
+        if name == "SrcDir": return str(os.path.dirname(self.configfile)).replace("\\", "\\\\")
         val = self.config
         for p in name.split("."):
             val = val[p]
@@ -370,6 +389,6 @@ class AndroidApk:
             offset = retval.find(startmarker, offset)
         return retval
 
-builder = AndroidApk("appmanifest.config")
+builder = AndroidApk(os.path.join(os.path.dirname(os.path.realpath(__file__)), "appmanifest.config"))
 builder.Generate()
 builder.Build()
